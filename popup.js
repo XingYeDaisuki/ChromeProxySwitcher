@@ -284,17 +284,10 @@ function updateScopeVisibility(config) {
   const cfg = config || {};
   const mode = cfg.mode || selectedMode();
   const targeted = mode === "targeted";
-  const targetsWasHidden = elements.targetsPanel.classList.contains("hidden");
-  const bypassWasHidden = elements.bypassPanel.classList.contains("hidden");
 
   elements.targetsPanel.classList.toggle("hidden", !targeted);
   elements.bypassPanel.classList.toggle("hidden", targeted);
   elements.scopeHint.textContent = targeted ? t("scopeHintTarget") : t("scopeHintAll");
-  if (targeted && targetsWasHidden) {
-    elements.targetsPanel.open = true;
-  } else if (!targeted && bypassWasHidden) {
-    elements.bypassPanel.open = true;
-  }
 }
 
 function updateAuthHint() {

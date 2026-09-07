@@ -529,6 +529,7 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .details-content {
   padding: 0 13px 13px;
+  animation: fade-down 0.16s ease-out;
 }
 
 .auth-fields {
