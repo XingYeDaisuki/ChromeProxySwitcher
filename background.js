@@ -329,10 +329,202 @@ async function getCurrentState() {
   return { config: cfg, applied };
 }
 
+const PROBE_URLS = [
+  "https://www.gstatic.com/generate_204",
+  "https://example.com"
+];
+
+async function probeUrls() {
+  let lastError = null;
+  for (const url of PROBE_URLS) {
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(url, {
+        cache: "no-store",
+        credentials: "omit",
+        redirect: "follow",
+        signal: controller.signal
+      });
+      const latencyMs = Date.now() - startedAt;
+      if (res.ok) {
+        return { ok: true, latencyMs, url };
+      }
+      lastError = new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  const failed = lastError && lastError.name === "AbortError" ? "timeout" : String((lastError && lastError.message) || lastError);
+  return { ok: false, error: failed };
+}
+
+async function runProxyTest(input) {
+  const testCfg = normalizeConfig(input);
+  testCfg.enabled = true;
+  testCfg.mode = "all"; // 连接测试不依赖名单，直接用服务器测试
+  testCfg.targets = "";
+  testCfg.bypass = "";
+  if (!testCfg.host) {
+    throw new Error("请填写代理服务器地址。");
+  }
+  if (!Number.isInteger(testCfg.port) || testCfg.port <= 0 || testCfg.port > 65535) {
+    throw new Error("端口必须是 1 - 65535 之间的整数。");
+  }
+
+  const previousCfg = await getConfig();
+  const sameAsActive =
+    previousCfg.enabled &&
+    previousCfg.protocol === testCfg.protocol &&
+    previousCfg.host === testCfg.host &&
+    previousCfg.port === testCfg.port &&
+    previousCfg.username === testCfg.username &&
+    previousCfg.password === testCfg.password;
+
+  let changedProxy = false;
+  try {
+    if (!sameAsActive) {
+      changedProxy = true;
+      await setConfig(testCfg);
+      await applyProxy(testCfg);
+      // 等代理设置真正生效后再探测
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return await probeUrls();
+  } finally {
+    if (changedProxy) {
+      try {
+        await setConfig(previousCfg);
+        await applyProxy(previousCfg);
+      } catch (err) {
+        console.error("[Proxy Switcher] restore proxy failed:", err);
+      }
+    }
+  }
+}
+
+const TAB_DOMAIN_TTL_MS = 30 * 60 * 1000; // 30 分钟内加载过的域名
+const TAB_DOMAIN_MAX = 60;
+const TAB_TRACKER_KEY = "tabDomainTracker";
+const tabDomainTracker = new Map();
+let trackerLoadedPromise = null;
+let trackerSaveTimer = null;
+
+function ensureTrackerLoaded() {
+  if (!trackerLoadedPromise) {
+    trackerLoadedPromise = (async () => {
+      try {
+        const stored = await chrome.storage.session.get(TAB_TRACKER_KEY);
+        const data = stored[TAB_TRACKER_KEY] || {};
+        const now = Date.now();
+        Object.keys(data).forEach((tabIdText) => {
+          const hosts = data[tabIdText] && data[tabIdText].domains;
+          if (!hosts) return;
+          const hostMap = new Map();
+          Object.keys(hosts).forEach((host) => {
+            const lastSeen = Number(hosts[host]);
+            if (now - lastSeen < TAB_DOMAIN_TTL_MS) {
+              hostMap.set(host, lastSeen);
+            }
+          });
+          if (hostMap.size > 0) tabDomainTracker.set(Number(tabIdText), hostMap);
+        });
+      } catch (err) {
+        // 会话存储不可用时仅保留内存数据
+      }
+    })();
+  }
+  return trackerLoadedPromise;
+}
+
+function recordTabDomain(tabId, rawUrl) {
+  if (!Number.isInteger(tabId) || tabId < 0) return;
+  let host;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+    host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  } catch (err) {
+    return;
+  }
+  if (!host) return;
+
+  const now = Date.now();
+  let hostMap = tabDomainTracker.get(tabId);
+  if (!hostMap) {
+    hostMap = new Map();
+    tabDomainTracker.set(tabId, hostMap);
+  }
+  hostMap.delete(host);
+  hostMap.set(host, now); // 重新放入末尾，保持“最近使用”顺序
+
+  if (hostMap.size > TAB_DOMAIN_MAX) {
+    const oldest = hostMap.keys().next().value;
+    if (oldest) hostMap.delete(oldest);
+  }
+
+  if (trackerSaveTimer) clearTimeout(trackerSaveTimer);
+  trackerSaveTimer = setTimeout(() => {
+    trackerSaveTimer = null;
+    persistTabDomainTracker();
+  }, 500);
+}
+
+async function persistTabDomainTracker() {
+  try {
+    const now = Date.now();
+    const output = {};
+    tabDomainTracker.forEach((hostMap, tabId) => {
+      const domains = {};
+      hostMap.forEach((lastSeen, host) => {
+        if (now - lastSeen < TAB_DOMAIN_TTL_MS) domains[host] = lastSeen;
+      });
+      if (Object.keys(domains).length > 0) {
+        output[String(tabId)] = { domains };
+      }
+    });
+    await chrome.storage.session.set({ [TAB_TRACKER_KEY]: output });
+  } catch (err) {
+    // 写入失败不影响使用，下次请求会重试
+  }
+}
+
+function getTabDomainSnapshot(tabId) {
+  if (!tabDomainTracker.has(tabId)) return [];
+  const hostMap = tabDomainTracker.get(tabId);
+  const now = Date.now();
+  const list = [];
+  hostMap.forEach((lastSeen, host) => {
+    if (now - lastSeen < TAB_DOMAIN_TTL_MS) {
+      list.push({ host, lastSeen });
+    }
+  });
+  list.sort((a, b) => b.lastSeen - a.lastSeen);
+  return list.slice(0, TAB_DOMAIN_MAX);
+}
+
+async function removeTabDomainTracker(tabId) {
+  tabDomainTracker.delete(tabId);
+  if (trackerSaveTimer) clearTimeout(trackerSaveTimer);
+  trackerSaveTimer = null;
+  await persistTabDomainTracker();
+}
+
 async function handleMessage(message) {
   switch (message && message.type) {
     case "getState": {
       return { ok: true, ...(await getCurrentState()) };
+    }
+    case "getTabDomains": {
+      await ensureTrackerLoaded();
+      const tabId = Number(message.tabId);
+      if (!Number.isInteger(tabId)) {
+        return { ok: true, domains: [] };
+      }
+      return { ok: true, domains: getTabDomainSnapshot(tabId) };
     }
     case "save": {
       const cfg = normalizeConfig(message.config);
@@ -353,6 +545,10 @@ async function handleMessage(message) {
       const result = await applyProxy(cfg);
       return { ok: true, ...result, config: cfg };
     }
+    case "testProxy": {
+      const result = await runProxyTest(message.config);
+      return { ok: true, ...result };
+    }
     default:
       throw new Error("未知的操作。");
   }
@@ -366,6 +562,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
     });
   return true; // 保持消息通道等待异步回复
+});
+
+// 记录当前标签页近期加载过的域名
+chrome.webRequest.onCompleted.addListener(
+  (details) => {
+    ensureTrackerLoaded()
+      .then(() => recordTabDomain(details.tabId, details.url))
+      .catch(() => recordTabDomain(details.tabId, details.url));
+  },
+  { urls: ["http://*/*", "https://*/*"] }
+);
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  removeTabDomainTracker(tabId).catch(() => {});
 });
 
 // 可选：HTTP / HTTPS 代理需要用户名密码时自动填充

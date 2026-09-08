@@ -23,7 +23,16 @@ const elements = {
   statusText: $("statusText"),
   message: $("message"),
   saveBtn: $("saveBtn"),
-  disableBtn: $("disableBtn")
+  disableBtn: $("disableBtn"),
+  testBtn: $("testBtn"),
+  testResult: $("testResult"),
+  siteQuickRow: $("siteQuickRow"),
+  currentSiteDomain: $("currentSiteDomain"),
+  siteToggleBtn: $("siteToggleBtn"),
+  siteToggleText: $("siteToggleText"),
+  tabDomainsPanel: $("tabDomainsPanel"),
+  tabDomainCount: $("tabDomainCount"),
+  tabDomainList: $("tabDomainList")
 };
 
 const PROTOCOL_LABELS = {
@@ -42,6 +51,12 @@ const I18N = {
     switchTitle: "启用或停用代理",
     appearanceTitle: "外观",
     langTitle: "语言",
+    siteLabel: "当前页面",
+    siteAdd: "加入代理",
+    siteRemove: "从名单移除",
+    tabDomainsTitle: "当前标签页域名",
+    tabDomainsHint: "自动记录本标签页近期加载过的域名，点击按钮即可加入或移出走代理名单。",
+    tabDomainsEmpty: "暂无记录",
     sectionProtocol: "代理协议",
     sectionScope: "代理范围",
     scopeAll: "全部流量",
@@ -68,6 +83,13 @@ const I18N = {
     bypassHint: "多个地址用逗号或换行分隔。",
     disable: "停用代理",
     save: "保存并应用",
+    testButton: "测试连接",
+    testRunning: "正在测试…",
+    testOk: "连接成功",
+    testFail: "连接失败，请检查代理地址与端口",
+    testTimeout: "连接超时，请检查代理是否可用",
+    testNoHost: "请先填写代理服务器地址",
+    testBadPort: "请输入正确的端口（1 - 65535）",
     statusOn: "已启用",
     statusOff: "未启用 · 使用系统代理",
     targetCount: (count) => `${count} 条`,
@@ -85,6 +107,12 @@ const I18N = {
     switchTitle: "Enable or disable proxy",
     appearanceTitle: "Appearance",
     langTitle: "Language",
+    siteLabel: "Current page",
+    siteAdd: "Add to proxy",
+    siteRemove: "Remove from list",
+    tabDomainsTitle: "Domains in this tab",
+    tabDomainsHint: "Recently loaded domains in this tab are recorded here. Click a button to add or remove it from the proxy list.",
+    tabDomainsEmpty: "No domains yet",
     sectionProtocol: "Protocol",
     sectionScope: "Proxy scope",
     scopeAll: "All traffic",
@@ -111,6 +139,13 @@ const I18N = {
     bypassHint: "Separate addresses with commas or new lines.",
     disable: "Disable proxy",
     save: "Save & apply",
+    testButton: "Test connection",
+    testRunning: "Testing…",
+    testOk: "Connection OK",
+    testFail: "Connection failed. Check the proxy address and port.",
+    testTimeout: "Timed out. Check whether the proxy is reachable.",
+    testNoHost: "Enter a proxy server address first.",
+    testBadPort: "Enter a valid port (1 - 65535).",
     statusOn: "Enabled",
     statusOff: "Disabled · System proxy",
     targetCount: (count) => (count === 1 ? "1 item" : `${count} items`),
@@ -128,6 +163,12 @@ const I18N = {
     switchTitle: "プロキシを有効化 / 無効化",
     appearanceTitle: "外観",
     langTitle: "言語",
+    siteLabel: "現在のページ",
+    siteAdd: "プロキシに追加",
+    siteRemove: "リストから削除",
+    tabDomainsTitle: "現在のタブのドメイン",
+    tabDomainsHint: "このタブで最近読み込まれたドメインを自動記録します。ボタンでプロキシリストに追加 / 削除できます。",
+    tabDomainsEmpty: "記録はありません",
     sectionProtocol: "プロトコル",
     sectionScope: "プロキシ対象",
     scopeAll: "すべての通信",
@@ -154,6 +195,13 @@ const I18N = {
     bypassHint: "複数のアドレスはカンマまたは改行で区切ります。",
     disable: "プロキシを無効化",
     save: "保存して適用",
+    testButton: "接続テスト",
+    testRunning: "テスト中…",
+    testOk: "接続成功",
+    testFail: "接続できません。プロキシのアドレスとポートを確認してください。",
+    testTimeout: "タイムアウトしました。プロキシが利用可能か確認してください。",
+    testNoHost: "プロキシサーバーのアドレスを入力してください。",
+    testBadPort: "正しいポート（1 ～ 65535）を入力してください。",
     statusOn: "有効",
     statusOff: "無効 · システムプロキシ",
     targetCount: (count) => `${count} 件`,
@@ -170,6 +218,9 @@ const I18N = {
 
 let currentLang = "zh";
 let messageTimer = null;
+let currentSite = null;
+let tabDomains = [];
+let tabDomainsRefreshTimer = null;
 
 function t(key) {
   const table = I18N[currentLang] || I18N.zh;
@@ -226,6 +277,7 @@ async function selectLanguage(lang) {
   setSegSelected(elements.langGroup, safe);
   clearMessage();
   updateUiState();
+  updateSiteRow();
   try {
     await chrome.storage.local.set({ [LANG_STORAGE_KEY]: safe });
   } catch (err) {
@@ -278,6 +330,7 @@ function fillForm(config) {
   elements.targets.value = config.targets || "";
   elements.bypass.value = config.bypass || "";
   updateUiState(config);
+  updateSiteRow();
 }
 
 function updateScopeVisibility(config) {
@@ -337,6 +390,203 @@ function showMessage(text, type) {
 function clearMessage() {
   elements.message.className = "message";
   elements.message.textContent = "";
+}
+
+function setTestResult(text, type) {
+  elements.testResult.textContent = text || "";
+  elements.testResult.className = `test-result ${type || ""}`.trim();
+}
+
+async function testConnection() {
+  const host = elements.host.value.trim();
+  const port = Number(elements.port.value);
+  if (!host) {
+    setTestResult(t("testNoHost"), "error");
+    return;
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    setTestResult(t("testBadPort"), "error");
+    return;
+  }
+
+  elements.testBtn.disabled = true;
+  setTestResult(t("testRunning"), "");
+  try {
+    const res = await sendMessage({
+      type: "testProxy",
+      config: readForm()
+    });
+    if (!res.ok) {
+      setTestResult(res && res.error === "timeout" ? t("testTimeout") : t("testFail"), "error");
+      return;
+    }
+    const latency = res.latencyMs != null ? ` · ${res.latencyMs} ms` : "";
+    setTestResult(`${t("testOk")}${latency}`, "success");
+  } catch (err) {
+    setTestResult(t("testFail"), "error");
+  } finally {
+    elements.testBtn.disabled = false;
+  }
+}
+
+function normalizeEntryHost(line) {
+  let text = String(line || "").trim().toLowerCase();
+  if (!text || text.startsWith("#")) return "";
+  text = text.replace(/\\\./g, ".");
+  const schemeIndex = text.indexOf("://");
+  if (schemeIndex >= 0) text = text.slice(schemeIndex + 3);
+  if (text.startsWith("//")) text = text.slice(2);
+  const slashIndex = text.indexOf("/");
+  if (slashIndex >= 0) text = text.slice(0, slashIndex);
+  const atIndex = text.lastIndexOf("@");
+  if (atIndex >= 0) text = text.slice(atIndex + 1);
+  text = text.replace(/^\[|\]$/g, "");
+  text = text.replace(/^\*\./, "").replace(/^\./, "").replace(/^www\./, "");
+  return text;
+}
+
+function domainInTargets(domain) {
+  if (!domain) return false;
+  const canon = normalizeEntryHost(domain);
+  if (!canon) return false;
+  return elements.targets.value
+    .split(/[\r\n]+/)
+    .some((line) => normalizeEntryHost(line) === canon);
+}
+
+function addDomainToTargets(domain) {
+  const canon = normalizeEntryHost(domain);
+  if (!canon || domainInTargets(canon)) return;
+  const text = elements.targets.value.replace(/\s+$/, "");
+  elements.targets.value = text ? `${text}\n${canon}` : canon;
+}
+
+function removeDomainFromTargets(domain) {
+  const canon = normalizeEntryHost(domain);
+  if (!canon) return;
+  const kept = elements.targets.value
+    .split(/[\r\n]+/)
+    .filter((line) => normalizeEntryHost(line) !== canon);
+  elements.targets.value = kept.join("\n").replace(/\n+$/, "");
+}
+
+function isCurrentSiteListed() {
+  return currentSite && currentSite.canonical && domainInTargets(currentSite.canonical);
+}
+
+function toggleProxyEntry(domain) {
+  const included = domainInTargets(domain);
+  if (included) {
+    removeDomainFromTargets(domain);
+  } else {
+    addDomainToTargets(domain);
+    setSegSelected(elements.modeGroup, "targeted");
+    elements.targetsPanel.classList.remove("hidden");
+    elements.targetsPanel.open = true;
+  }
+  updateUiState();
+}
+
+function updateSiteRow() {
+  if (!currentSite || !currentSite.canonical) {
+    elements.siteQuickRow.classList.add("hidden");
+    renderTabDomains();
+    return;
+  }
+  elements.siteQuickRow.classList.remove("hidden");
+  elements.currentSiteDomain.textContent = currentSite.canonical;
+  elements.siteToggleText.textContent = isCurrentSiteListed() ? t("siteRemove") : t("siteAdd");
+  renderTabDomains();
+}
+
+async function getActiveSite() {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs && tabs[0];
+    const url = tab && (tab.url || tab.pendingUrl);
+    if (!url || tab.id == null) return null;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    const host = parsed.hostname.toLowerCase();
+    return {
+      tabId: tab.id,
+      host,
+      canonical: host.replace(/^www\./, "")
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function initCurrentSite() {
+  currentSite = await getActiveSite();
+  updateSiteRow();
+  renderTabDomains();
+  await refreshTabDomains();
+}
+
+function renderTabDomains() {
+  if (!currentSite || currentSite.tabId == null) {
+    elements.tabDomainsPanel.classList.add("hidden");
+    elements.tabDomainList.replaceChildren();
+    return;
+  }
+  elements.tabDomainsPanel.classList.remove("hidden");
+  elements.tabDomainCount.textContent = String(tabDomains.length);
+  elements.tabDomainList.replaceChildren();
+
+  if (tabDomains.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "domain-empty";
+    empty.textContent = t("tabDomainsEmpty");
+    elements.tabDomainList.append(empty);
+    return;
+  }
+
+  tabDomains.forEach((item) => {
+    const host = String(item && item.host ? item.host : "").replace(/^www\./, "");
+    if (!host) return;
+    const row = document.createElement("div");
+    row.className = "domain-item";
+
+    const name = document.createElement("span");
+    name.className = "domain-name";
+    name.textContent = host;
+    name.title = host;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn ghost site-btn domain-btn";
+    btn.dataset.domain = host;
+    const label = document.createElement("span");
+    label.textContent = domainInTargets(host) ? t("siteRemove") : t("siteAdd");
+    btn.append(label);
+
+    row.append(name, btn);
+    elements.tabDomainList.append(row);
+  });
+}
+
+async function refreshTabDomains() {
+  if (!currentSite || currentSite.tabId == null) return;
+  try {
+    const res = await sendMessage({
+      type: "getTabDomains",
+      tabId: currentSite.tabId
+    });
+    if (res.ok) {
+      tabDomains = Array.isArray(res.domains) ? res.domains : [];
+      renderTabDomains();
+    }
+  } catch (err) {
+    // 读取域名记录失败不阻塞弹窗
+  }
+}
+
+async function toggleCurrentSite() {
+  if (!currentSite || !currentSite.canonical) return;
+  toggleProxyEntry(currentSite.canonical);
+  updateSiteRow();
 }
 
 function validateForm(config) {
@@ -434,10 +684,36 @@ elements.host.addEventListener("input", () => {
 elements.targets.addEventListener("input", () => {
   updateTargetCount();
   updateUiState();
+  updateSiteRow();
 });
 
 elements.bypass.addEventListener("input", () => {
   updateUiState();
+});
+
+elements.testBtn.addEventListener("click", () => {
+  testConnection();
+});
+
+elements.siteToggleBtn.addEventListener("click", () => {
+  toggleCurrentSite();
+});
+
+elements.tabDomainList.addEventListener("click", (event) => {
+  const btn = event.target.closest(".domain-btn");
+  if (!btn || !btn.dataset.domain) return;
+  toggleProxyEntry(btn.dataset.domain);
+  updateSiteRow();
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "session" && changes.tabDomainTracker) {
+    if (tabDomainsRefreshTimer) return;
+    tabDomainsRefreshTimer = setTimeout(() => {
+      tabDomainsRefreshTimer = null;
+      refreshTabDomains();
+    }, 350);
+  }
 });
 
 elements.saveBtn.addEventListener("click", () => {
@@ -462,6 +738,7 @@ elements.disableBtn.addEventListener("click", () => {
       // 清理旧版颜色主题偏好，失败也不影响使用
     }
     await refresh();
+    await initCurrentSite();
   } catch (err) {
     showMessage(err.message || t("errorInit"), "error");
   }
